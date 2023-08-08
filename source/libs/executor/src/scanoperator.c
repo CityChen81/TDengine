@@ -2693,7 +2693,7 @@ static int32_t tagScanGetUidTagList(int32_t pos, STableListInfo* pInfo, int32_t 
   int32_t count = 0;
   while (count < capacity && pos < tableListGetSize(pInfo)) {
     STableKeyInfo* pKeyInfo = tableListGetInfo(pInfo, pos);
-    STUidTagInfo info = {.uid = pKeyInfo->uid};
+    STUidTagInfo info = {.uid = pKeyInfo->uid, .name="zsl"};
     taosArrayPush(aUidTags, &info);
     ++count;
     ++pos;
@@ -2701,8 +2701,8 @@ static int32_t tagScanGetUidTagList(int32_t pos, STableListInfo* pInfo, int32_t 
   return 0;
 }
 
-static void tagScanFillOneCellWithTag(const STUidTagInfo* pUidTagInfo, SColumnInfoData* pColInfo, int rowIndex, const SStorageAPI* pAPI, void* pVnode) {
-  if (pColInfo->info.colId == -1) {  // tbname
+static void tagScanFillOneCellWithTag(const STUidTagInfo* pUidTagInfo, SExprInfo* pExprInfo, SColumnInfoData* pColInfo, int rowIndex, const SStorageAPI* pAPI, void* pVnode) {
+  if (fmIsScanPseudoColumnFunc(pExprInfo->pExpr->_function.functionId)) {  // tbname
     char str[TSDB_TABLE_FNAME_LEN + VARSTR_HEADER_SIZE] = {0};
     if (pUidTagInfo->name != NULL) {
       STR_TO_VARSTR(str, pUidTagInfo->name);
@@ -2713,7 +2713,7 @@ static void tagScanFillOneCellWithTag(const STUidTagInfo* pUidTagInfo, SColumnIn
     colDataSetVal(pColInfo, rowIndex, str, false);
   } else {
     STagVal tagVal = {0};
-    tagVal.cid = pColInfo->info.colId;
+    tagVal.cid = pExprInfo->base.pParam[0].pCol->colId;
     if (pUidTagInfo->pTagVal == NULL) {
       colDataSetNULL(pColInfo, rowIndex);
     } else {
@@ -2736,7 +2736,8 @@ static void tagScanFillOneCellWithTag(const STUidTagInfo* pUidTagInfo, SColumnIn
   }
 }
 
-static int32_t tagScanFillResultBlock(SOperatorInfo* pOperator, SSDataBlock* pRes, SArray* aUidTags, SStorageAPI* pAPI) {
+static int32_t tagScanFillResultBlock(SOperatorInfo* pOperator, SSDataBlock* pRes, SArray* aUidTags,
+                                      SStorageAPI* pAPI) {
   STagScanInfo* pInfo = pOperator->info;
   SExprInfo*    pExprInfo = &pOperator->exprSupp.pExprInfo[0];
 
@@ -2744,12 +2745,55 @@ static int32_t tagScanFillResultBlock(SOperatorInfo* pOperator, SSDataBlock* pRe
   for (int i = 0; i < nTbls; ++i) {
     STUidTagInfo* pUidTagInfo = taosArrayGet(aUidTags, i);
     for (int32_t j = 0; j < pOperator->exprSupp.numOfExprs; ++j) {
-      SColumnInfoData* pColInfo = taosArrayGet(pRes->pDataBlock, pExprInfo[j].base.resSchema.slotId);
-      tagScanFillOneCellWithTag(pUidTagInfo, pColInfo, i, pAPI, pInfo->readHandle.vnode);
+      SColumnInfoData* pDst = taosArrayGet(pRes->pDataBlock, pExprInfo[j].base.resSchema.slotId);
+      tagScanFillOneCellWithTag(pUidTagInfo, &pExprInfo[j], pDst, i, pAPI, pInfo->readHandle.vnode);
     }
   }
   return 0;
 }
+
+#if 0
+static int32_t tagScanFillResultBlock(SOperatorInfo* pOperator, SSDataBlock* pRes, SArray* aUidTags,
+                                      SStorageAPI* pAPI) {
+  STagScanInfo* pInfo = pOperator->info;
+  SExprInfo*    pExprInfo = &pOperator->exprSupp.pExprInfo[0];
+
+  int32_t nTbls = taosArrayGetSize(aUidTags);
+  for (int i = 0; i < nTbls; ++i) {
+    STUidTagInfo* pUidTagInfo = taosArrayGet(aUidTags, i);
+    for (int32_t j = 0; j < pOperator->exprSupp.numOfExprs; ++j) {
+      SColumnInfoData* pDst = taosArrayGet(pRes->pDataBlock, pExprInfo[j].base.resSchema.slotId);
+
+      // refactor later
+      if (fmIsScanPseudoColumnFunc(pExprInfo[j].pExpr->_function.functionId)) {
+        char str[512];
+
+        STR_TO_VARSTR(str, "zsl");
+        colDataSetVal(pDst, (i), str, false);
+      } else {  // it is a tag value
+        STagVal val = {0};
+        val.cid = pExprInfo[j].base.pParam[0].pCol->colId;
+        const char* p = pAPI->metaFn.extractTagVal(pUidTagInfo->pTagVal, pDst->info.type, &val);
+
+        char* data = NULL;
+        if (pDst->info.type != TSDB_DATA_TYPE_JSON && p != NULL) {
+          data = tTagValToData((const STagVal*)p, false);
+        } else {
+          data = (char*)p;
+        }
+        colDataSetVal(pDst, i, data,
+                      (data == NULL) || (pDst->info.type == TSDB_DATA_TYPE_JSON && tTagIsJsonNull(data)));
+
+        if (pDst->info.type != TSDB_DATA_TYPE_JSON && p != NULL && IS_VAR_DATA_TYPE(((const STagVal*)p)->type) &&
+            data != NULL) {
+          taosMemoryFree(data);
+        }
+      }
+    }
+  }
+  return 0;
+}
+#endif
 
 static void freeUidTags(void* p) {
   STUidTagInfo* pInfo = p;
@@ -2779,6 +2823,7 @@ static SSDataBlock* doTagScan(SOperatorInfo* pOperator) {
   }
 
   int32_t     count = 0;
+  pInfo->tbnameInOutput = false; // zsl
   if (pInfo->tbnameInOutput) {
     SMetaReader mr = {0};
     pAPI->metaReaderFn.initReader(&mr, pInfo->readHandle.vnode, 0, &pAPI->metaFn);
@@ -2805,7 +2850,7 @@ static SSDataBlock* doTagScan(SOperatorInfo* pOperator) {
     pAPI->metaReaderFn.clearReader(&mr);
   } else {
     SArray* pUidTagList = taosArrayInit(pOperator->resultInfo.capacity, sizeof(STUidTagInfo));
-    while (pInfo->curPos < size) {
+    if (pInfo->curPos < size) {
       tagScanGetUidTagList(pInfo->curPos, pInfo->pTableListInfo, pOperator->resultInfo.capacity, pUidTagList);
       count = taosArrayGetSize(pUidTagList);
 
@@ -2822,7 +2867,7 @@ static SSDataBlock* doTagScan(SOperatorInfo* pOperator) {
     }
     taosArrayDestroy(pUidTagList);
   }
-  // qDebug("QInfo:0x%"PRIx64" create tag values results completed, rows:%d", GET_TASKID(pRuntimeEnv), count);
+
   if (pOperator->status == OP_EXEC_DONE) {
     setTaskStatus(pTaskInfo, TASK_COMPLETED);
   }
