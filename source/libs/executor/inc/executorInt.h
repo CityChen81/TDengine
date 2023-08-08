@@ -258,6 +258,7 @@ typedef struct STagScanInfo {
   SLimitNode*     pSlimit;
   SReadHandle     readHandle;
   STableListInfo* pTableListInfo;
+  bool            tbnameInOutput;
 } STagScanInfo;
 
 typedef enum EStreamScanMode {
